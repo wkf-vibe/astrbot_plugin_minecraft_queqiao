@@ -20,6 +20,8 @@ from .constants import (
     DEFAULT_CONNECT_FAIL_NOTIFY_FORMAT,
     DEFAULT_CONNECT_NOTIFY_FORMAT,
     DEFAULT_DISPLAY_NAME,
+    DEFAULT_FORWARD_BATCH_ENABLED,
+    DEFAULT_FORWARD_BATCH_SECONDS,
     DEFAULT_LOW_FREQUENCY_INTERVAL,
     DEFAULT_LOW_FREQUENCY_THRESHOLD,
     DEFAULT_MONITOR_INTERVAL,
@@ -37,6 +39,8 @@ from .constants import (
     DEFAULT_TERMINAL_DAYS,
     DEFAULT_WS_URL,
     EMOJI_OK_GESTURE,
+    FORWARD_BATCH_SECONDS_MAX,
+    FORWARD_BATCH_SECONDS_MIN,
     MONITOR_MIN_INTERVAL,
     QUIET_HOURS_ITEM_KEYS,
     QUIET_HOURS_TIME_PATTERN,
@@ -262,6 +266,10 @@ class ServerConfig:
     chatimage_name: str = DEFAULT_CHATIMAGE_NAME
     # 游戏内聊天消息中的图片（ChatImage CICode 代码 / 图片链接）下载后作为图片转发到外部
     forward_image_from_mc: bool = False
+    # 聊天批量合并：开启后窗口内（从首条消息起算）的聊天攒起来合并成一条发出，
+    # 避免刷屏式逐条转发；只作用于聊天，进出/死亡/成就仍即时单条发送
+    forward_batch_enabled: bool = DEFAULT_FORWARD_BATCH_ENABLED
+    forward_batch_seconds: int = DEFAULT_FORWARD_BATCH_SECONDS
 
     # ---- 远程指令 ----
     cmd_enabled: bool = True
@@ -608,6 +616,15 @@ class ServerConfig:
             ).strip()
             or DEFAULT_CHATIMAGE_NAME,
             forward_image_from_mc=_to_bool(message.get("forward_image_from_mc"), False),
+            forward_batch_enabled=_to_bool(
+                message.get("forward_batch_enabled"), DEFAULT_FORWARD_BATCH_ENABLED
+            ),
+            forward_batch_seconds=_to_int_clamped(
+                message.get("forward_batch_seconds"),
+                DEFAULT_FORWARD_BATCH_SECONDS,
+                FORWARD_BATCH_SECONDS_MIN,
+                FORWARD_BATCH_SECONDS_MAX,
+            ),
             cmd_enabled=_to_bool(cmd.get("enabled"), True),
             cmd_white_black_list=list_mode,
             cmd_list=_to_list(

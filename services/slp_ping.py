@@ -21,6 +21,7 @@ from __future__ import annotations
 import asyncio
 import json
 import re
+import socket
 import struct
 import time
 import zlib
@@ -33,6 +34,11 @@ _PROTOCOL_VERSION = -1
 # 握手 next state=1：进入 status 阶段
 _NEXT_STATE_STATUS = 1
 _STATUS_PACKET_ID = 0x00
+
+# PROXY protocol v2（Paper `proxies.proxy-protocol: true` 时必须先发）：
+# 12 字节签名 + version/command（0x21 = v2 + PROXY）
+_PROXY_V2_SIGNATURE = b"\x0d\x0a\x0d\x0a\x00\x0d\x0a\x51\x55\x49\x54\x0a"
+_PROXY_V2_CMD_PROXY = b"\x21"
 
 # § 后跟一位格式/颜色代码（如 §a、§6、§r）。SLP players.sample 的名字在
 # 部分服务端会被塞入这类彩色/广告文本，直连查询展示前剥离成可读纯文本。
@@ -141,20 +147,71 @@ async def mc_ping(
 ) -> McPingResult | None:
     """直连服务器执行一次状态查询，返回 RTT 与响应摘要；失败返回 None。
 
-    失败（连接拒绝 / 非 MC 端口 / 超时 / 响应非法）统一返回 None，由调用方
-    记录错误状态；超时期间方法自身会被 ``asyncio.wait_for`` 保证终止。
+    失败原因（连接拒绝 / 超时 / 非 MC 端口 / 响应非法）需要展示给用户时，
+    改用 ``mc_ping_ex`` 取回原因文本。
     """
-    if not host:
+    result, _ = await mc_ping_ex(host, port, timeout=timeout)
+    return result
+
+
+def _proxy_v2_header(
+    sockname: tuple[str, int] | None, peername: tuple[str, int] | None
+) -> bytes | None:
+    """按 PROXY protocol v2 生成 IPv4/IPv6 的 PROXY 头（非 PROXY 命令）。
+
+    Paper 开启 ``proxies.proxy-protocol`` 后，**任何**连到游戏端口的连接都要
+    先收到 PROXY 头（FRP 隧道就是这么做的），否则服务端一直等头、不回状态
+    响应——表现为「TCP 能连上但 SLP 永远超时」。
+    """
+    if not sockname or not peername:
         return None
+    try:
+        src_ip, src_port = sockname[0], int(sockname[1])
+        dst_ip, dst_port = peername[0], int(peername[1])
+        if ":" in src_ip:
+            src = socket.inet_pton(socket.AF_INET6, src_ip)
+            dst = socket.inet_pton(socket.AF_INET6, dst_ip)
+            family_proto = b"\x21"  # AF_INET6 + STREAM
+        else:
+            src = socket.inet_aton(src_ip)
+            dst = socket.inet_aton(dst_ip)
+            family_proto = b"\x11"  # AF_INET + STREAM
+        body = src + dst + struct.pack(">HH", src_port, dst_port)
+        return (
+            _PROXY_V2_SIGNATURE
+            + _PROXY_V2_CMD_PROXY
+            + family_proto
+            + struct.pack(">H", len(body))
+            + body
+        )
+    except (OSError, ValueError, IndexError):
+        return None
+
+
+async def _probe_once(
+    host: str, port: int, timeout: float, use_proxy_protocol: bool
+) -> tuple[McPingResult | None, str, bool]:
+    """单次 SLP 探测，返回 ``(结果, 失败原因, TCP 是否连上)``。"""
     started = time.monotonic()
     try:
         reader, writer = await asyncio.wait_for(
             asyncio.open_connection(host, port), timeout
         )
-    except (OSError, asyncio.TimeoutError):
-        return None
+    except asyncio.TimeoutError:
+        return None, f"连接 {host}:{port} 超时（地址/端口不可达或被防火墙丢弃）", False
+    except ConnectionRefusedError:
+        return None, f"连接 {host}:{port} 被拒绝（端口未监听）", False
+    except OSError as exc:
+        return None, f"连接 {host}:{port} 失败：{exc}", False
 
     try:
+        if use_proxy_protocol:
+            header = _proxy_v2_header(
+                writer.get_extra_info("sockname"), writer.get_extra_info("peername")
+            )
+            if header is None:
+                return None, f"{host}:{port} 无法生成 PROXY v2 头", True
+            writer.write(header)
         host_bytes = host.encode()
         handshake = (
             b"\x00"
@@ -169,8 +226,14 @@ async def mc_ping(
         await asyncio.wait_for(writer.drain(), timeout)
 
         data = await asyncio.wait_for(_read_packet(reader, timeout), timeout)
-    except (OSError, ConnectionError, ValueError, asyncio.TimeoutError):
-        return None
+    except asyncio.TimeoutError:
+        return (
+            None,
+            f"{host}:{port} 端口可连接但未返回状态响应（超时）",
+            True,
+        )
+    except (OSError, ConnectionError, ValueError) as exc:
+        return None, f"{host}:{port} 状态响应异常：{exc}", True
     finally:
         writer.close()
         try:
@@ -185,16 +248,16 @@ async def mc_ping(
         raw = data[offset : offset + json_len]
         payload = json.loads(raw.decode("utf-8", "replace"))
     except (ValueError, UnicodeDecodeError):
-        return None
+        return None, f"{host}:{port} 响应不是 Minecraft 状态协议", True
     # 严格校验：必须是合法 MC 状态响应（含 version / players 等结构）。
     # 避免把 HTTP 等非 MC 服务（如鹊桥 Web 端口）的响应误判为成功——
     # 那会让延迟显示一个并非游戏端口的假低值
     if not isinstance(payload, dict):
-        return None
+        return None, f"{host}:{port} 响应不是 Minecraft 状态协议", True
     if not isinstance(payload.get("version"), dict) and not isinstance(
         payload.get("players"), dict
     ):
-        return None
+        return None, f"{host}:{port} 响应不是 Minecraft 状态协议", True
 
     version = payload.get("version") or {}
     players = payload.get("players") or {}
@@ -209,14 +272,43 @@ async def mc_ping(
             name = _strip_format_codes(_component_text(item.get("name")))
             if name:
                 player_names.append(name)
-    return McPingResult(
-        rtt_ms=rtt_ms,
-        version_name=str(version.get("name") or ""),
-        online=int(players.get("online") or 0),
-        max_players=int(players.get("max") or 0),
-        description=_component_text(payload.get("description", "")),
-        player_names=player_names,
+    return (
+        McPingResult(
+            rtt_ms=rtt_ms,
+            version_name=str(version.get("name") or ""),
+            online=int(players.get("online") or 0),
+            max_players=int(players.get("max") or 0),
+            description=_component_text(payload.get("description", "")),
+            player_names=player_names,
+        ),
+        "",
+        True,
     )
+
+
+async def mc_ping_ex(
+    host: str, port: int = 25565, timeout: float = 5.0
+) -> tuple[McPingResult | None, str]:
+    """SLP 探测并返回 ``(结果, 失败原因)``；成功时失败原因为空串。
+
+    先按普通 SLP 握手探测；若「TCP 连上了但服务端不回状态响应」，再带一个
+    PROXY protocol v2 头重试一次——服务端开了 ``proxy-protocol``（FRP 隧道
+    直连的常见形态）时，必须先收到 PROXY 头才会处理 SLP。两种都不通才判定
+    失败，并把最后一次的具体原因交给调用方展示。
+    """
+    if not host:
+        return None, "未配置探测地址"
+    result, reason, connected = await _probe_once(host, port, timeout, False)
+    if result is not None:
+        return result, ""
+    # 明确不可达（拒绝/连接超时/响应非法）时，PROXY 头也救不回来
+    if not connected or "未返回状态响应" not in reason:
+        return None, reason
+
+    retried, retry_reason, _ = await _probe_once(host, port, timeout, True)
+    if retried is not None:
+        return retried, ""
+    return None, f"{retry_reason}（已尝试 PROXY v2 兼容头）"
 
 
 def brand_from_slp(version_name: str, description: str = "") -> str | None:

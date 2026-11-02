@@ -33,6 +33,12 @@ class ServerInstance:
         # False 缓存至本次连接结束：不再重复探测，避免仪表盘每次刷新都向
         # 未开启 RCON 的鹊桥端发 send_rcon_command、在 MC 控制台刷报错。
         self.queqiao_rcon_ok: bool | None = None
+        # 本次连接内是否已向鹊桥探测过 RCON（`list` 探测）。None 状态下
+        # 普通请求也允许探测**一次**：否则插件刚启动/刚重连后，用户点
+        # 「玩家列表」只会拿到 SLP 兜底甚至「无法获取」，即使鹊桥 RCON
+        # 本来是好的。探测一次后无论结果如何都不再重复，避免向未开 RCON
+        # 的鹊桥端持续发指令刷报错
+        self._rcon_probe_done = False
         # 本次连接建立时刻（None = 未连接），供仪表盘展示单服务器在线时长
         self.connected_at: float | None = None
 
@@ -49,10 +55,10 @@ class ServerInstance:
                     await res
 
         async def _wrapped_on_connect() -> None:
-            # 重连后 RCON 可用性结论过期，重置为未确认（None）；恢复探测
-            # 由下一次「进入面板/手动刷新」（force）触发——未确认状态下
-            # 普通请求（自动轮询/监控采样）不主动向鹊桥发 RCON 指令。
+            # 重连后 RCON 可用性结论过期，重置为未确认（None）；下一次
+            # 玩家列表取数会重新探测一次，结论确认后不再重复
             self.queqiao_rcon_ok = None
+            self._rcon_probe_done = False
             self.connected_at = time.time()
             if on_connect:
                 res = on_connect()
@@ -219,33 +225,37 @@ class ServerInstance:
 
         ``force_rcon`` 为 True 时（仪表盘手动刷新/进入面板，``/servers?force=1``）：
         **每次都会重置**「鹊桥 RCON 不可用」结论并重新探测一次（用户可能刚
-        在鹊桥侧开启 RCON）；探测确认不可用后，同一连接内的普通请求（自动
-        轮询/监控采样）不再重试，直到下一次 force 触发。未确认（None）状态
-        下的普通请求不主动向鹊桥发 RCON 指令（探测仅由 force 触发，避免向
-        未开启 RCON 的鹊桥端反复发指令刷报错）；已确认可用（True）或配了
-        直连 RCON / 鹊桥未连接时，普通请求照常走 RCON。
+        在鹊桥侧开启 RCON）。未确认（None）状态下，普通请求也允许探测**一次**
+        （本次连接内只探测一次），避免插件刚启动/刚重连时用户点「玩家列表」
+        只拿到 SLP 兜底；探测得不出结论（超时）时不再重复，直到下一次 force
+        或重连。
         """
         if force_rcon and self.queqiao_rcon_ok is False and self.client.connected:
             # 进入面板/手动刷新：重置「不可用」结论，本次允许重新探测一次
             self.queqiao_rcon_ok = None
+            self._rcon_probe_done = False
         # ① RCON list（完整权威）：鹊桥 send_rcon_command → 直连 RCON 兜底
         #    记录实际通道（queqiao / direct），供渲染层标注取数方式
-        #    探测守卫：仅 force（显式探测）/ 已确认可用 / 配了直连 RCON /
-        #    鹊桥未连接（直连兜底）时执行；未确认（None）的普通请求跳过，
-        #    避免自动轮询与监控采样反复向未开启 RCON 的鹊桥端发指令。
+        #    探测守卫：已确认不可用（False）时不再探测；未确认（None）时
+        #    本次连接内允许探测一次（`_rcon_probe_done`）
         output, channel = None, ""
         if self.queqiao_rcon_ok is not False and (
             force_rcon
             or self.queqiao_rcon_ok is True
             or self.rcon.enabled
             or not self.client.connected
+            or not self._rcon_probe_done
         ):
+            if self.queqiao_rcon_ok is None:
+                self._rcon_probe_done = True
             output, channel = await self.execute_command_with_channel("list")
         if output is not None:
-            parsed_names = RconClient.parse_player_list(output)
+            online, cap, parsed_names = RconClient.parse_list_output(output)
             self.online_players = set(parsed_names)
             return PlayerListResult(
                 names=parsed_names,
+                online=online if online is not None else len(parsed_names),
+                max=cap or 0,
                 source="rcon",
                 rcon_channel=channel,
             )

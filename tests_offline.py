@@ -133,6 +133,17 @@ print("=== 7. RCON list 解析 ===")
 assert RconClient.parse_player_list("There are 2 of a max of 20 players online: Alice, Bob")==["Alice","Bob"]
 assert RconClient.parse_player_list("There are 0 of a max of 20 players online: ")==[]
 assert RconClient.parse_player_list(None)==[]
+# 人数/上限解析：部分服务端会给 list 输出染色，颜色码夹在数字间会切断正则
+assert RconClient.parse_list_output(
+    "There are 2 of a max of 20 players online: tree, kebee"
+) == (2, 20, ["tree", "kebee"])
+assert RconClient.parse_list_output(
+    "§6There are §a3§6 of a max of §a20§6 players online: §atree§r, §akebee§r, §aAlex"
+) == (3, 20, ["tree", "kebee", "Alex"])
+assert RconClient.parse_list_output(
+    "There are 0 of a maximum of 20 players online: "
+) == (0, 20, [])
+assert RconClient.parse_list_output(None) == (None, None, [])
 print("OK")
 
 print("=== 8. 回声抑制 + 转发判定 ===")
@@ -2453,13 +2464,24 @@ assert _i7.queqiao_rcon_ok is False and _i7.client.rcon_calls == 1
 _r7b = asyncio.run(_i7.fetch_player_list())
 assert _i7.client.rcon_calls == 1, "已确认鹊桥 RCON 不可用后不得重复探测"
 assert _r7b.source == "slp" and _r7b.names == ["Steve"]
-# 未确认（None，如重连后）状态下，普通请求不主动探测（探测只由 force 触发）
+# 未确认（None，如插件刚启动/刚重连）状态下，普通请求也允许探测**一次**：
+# 否则用户点「玩家列表」只会拿到 SLP 兜底甚至「无法获取」，即使鹊桥 RCON
+# 本来是好的。探测一次后不再重复，避免向未开 RCON 的鹊桥端反复发指令
 _i7d = _mk_inst30(_Cli30(connected=True, rcon_out=None,
     status={"server_list_ping": {"players": {"online": 1, "max": 20, "sample": [
         {"name": "Steve", "id": "u"}]}}}))
 _r7d = asyncio.run(_i7d.fetch_player_list())
-assert _i7d.client.rcon_calls == 0, "未确认状态下的普通请求不主动探测 RCON"
-assert _i7d.queqiao_rcon_ok is None and _r7d.source == "slp"
+assert _i7d.client.rcon_calls == 1, "未确认状态下的首次取数应探测一次 RCON"
+assert _i7d.queqiao_rcon_ok is False and _r7d.source == "slp"
+asyncio.run(_i7d.fetch_player_list())
+assert _i7d.client.rcon_calls == 1, "同一次连接内探测过就不再重复探测"
+# 超时（结果未知）同样只探测一次：避免每次自动轮询都向鹊桥发一条指令
+_i7e = _mk_inst30(_Cli30(connected=True, rcon_timeout=True,
+    status={"server_list_ping": {"players": {"online": 1, "max": 20}}}))
+asyncio.run(_i7e.fetch_player_list())
+assert _i7e.client.rcon_calls == 1 and _i7e.queqiao_rcon_ok is None
+asyncio.run(_i7e.fetch_player_list())
+assert _i7e.client.rcon_calls == 1, "超时结论不明时也不得反复探测"
 # 重连（None）后再次进入面板/手动刷新（force）→ 恢复探测
 _i7.queqiao_rcon_ok = None
 _i7.client._rcon_out = "There are 1 of a max of 20 players online: Steve"
@@ -3257,6 +3279,14 @@ assert _parse_tps35("TPS from last 1m, 5m, 15m: 20.0, 20.0, 20.0") == (20.0, 20.
 assert _parse_tps35("TPS from last 1m, 5m, 15m: 12.5, 15.2, 17.8") == (12.5, 15.2, 17.8)
 assert _parse_tps35("⏱  TPS from last 1m, 5m, 15m: 20.0, 18.2, 19.5") == (20.0, 18.2, 19.5)
 assert _parse_tps35("§aTPS from last 1m, 5m, 15m: 19.5, 20.0, 20.0") == (19.5, 20.0, 20.0)
+# Paper 实际输出：颜色码夹在数字之间（§a20.0§r, §a20.0§r, §a20.0）——
+# 不剥离会切断正则，此前线上 TPS 一直解析失败
+assert _parse_tps35(
+    "§6TPS from last 1m, 5m, 15m: §a20.0§r, §a20.0§r, §a20.0\n"
+) == (20.0, 20.0, 20.0)
+assert _parse_tps35(
+    "§6TPS from last 1m, 5m, 15m: §e19.98§r, §a20.0§r, §a20.0"
+) == (19.98, 20.0, 20.0)
 # 无标准前缀但有 TPS 字样的裸三数（防御兼容）
 assert _parse_tps35("TPS: 20.0, 19.0, 18.0") == (20.0, 19.0, 18.0)
 # 原版端 Unknown command / 空输出 / None → 不可解析
@@ -3527,13 +3557,16 @@ _col35 = _MC35(_mdir35, _sm35)
 _col35._ping = None  # 每台服务器按需替换的 fake ping
 
 async def _fake_ping_ok35(host, port, timeout=5.0):
-    return _FakePing35()
+    return _FakePing35(), ""
+
 
 async def _fake_ping_forge35(host, port, timeout=5.0):
-    return _FakePing35(version_name="forge 1.20.1", online=0)
+    return _FakePing35(version_name="forge 1.20.1", online=0), ""
+
 
 async def _fake_ping_none35(host, port, timeout=5.0):
-    return None
+    return None, "连接 127.0.0.1:25565 被拒绝（端口未监听）"
+
 
 async def _fake_ping_boom35(host, port, timeout=5.0):
     raise ConnectionError("simulated failure")
@@ -3626,17 +3659,19 @@ async def _d35():
     _col35._ping = _fake_ping_forge35
     await _smp("SrvForge")
     assert _col35._server_types.get("SrvForge") == "forge", "SLP 应缓存服务端品牌"
-    assert _sm35.get("SrvForge").commands[-1] == "tps", "首轮无缓存时用默认 tps"
+    # 采样每轮还会发一次 RCON list（在线人数以 list 为准），此处只看 TPS 指令
+    _tps_cmds35 = lambda: [c for c in _sm35.get("SrvForge").commands if c != "list"]  # noqa: E731
+    assert _tps_cmds35()[-1] == "tps", "首轮无缓存时用默认 tps"
     await _smp("SrvForge")
-    assert _sm35.get("SrvForge").commands[-1] == "forge tps", "识别 forge 后自动切换指令"
+    assert _tps_cmds35()[-1] == "forge tps", "识别 forge 后自动切换指令"
     assert _col35.status("SrvForge")["tps_command_resolved"] == "forge tps"
     assert _col35.status("SrvForge")["server_type"] == "forge"
     _col35.apply_settings("SrvForge", {"tps_command": "spark tps"})
     await _smp("SrvForge")
-    assert _sm35.get("SrvForge").commands[-1] == "spark tps", "显式指令覆盖自动选择"
+    assert _tps_cmds35()[-1] == "spark tps", "显式指令覆盖自动选择"
     _col35.apply_settings("SrvForge", {"tps_command": "spark tps"})
     await _smp("SrvForge")
-    assert _sm35.get("SrvForge").commands[-1] == "spark tps", "显式指令覆盖自动选择"
+    assert _tps_cmds35()[-1] == "spark tps", "显式指令覆盖自动选择"
 
     # 动态设置（仪表盘入口，不走 conf schema）：apply_settings 即时生效 + 持久化
     _upd35 = _col35.apply_settings("Srv", {"enabled": False, "interval": 120, "retention_days": 3})
@@ -3971,28 +4006,42 @@ _col38._ping = _fake_ping_ok35
 
 
 async def _rt38():
-    # enabled=False 启动：实时任务常驻但空转（与 _loop 同架构）
-    _col38.start({"Srv": _SC35.from_dict({"monitor": {"enabled": False}})})
+    # 默认开启启动：实时任务常驻（与 _loop 同架构）
+    _col38.start({"Srv": _SC35.from_dict({})})
     assert "Srv" in _col38._realtime_tasks and not _col38._realtime_tasks["Srv"].done(), \
         "实时采样任务应随 start 常驻"
     # 与正常周期共用同一把互斥锁（严格串行）
     assert _col38._lock_for("Srv") is _col38._lock_for("Srv")
+    # 隔离实时任务：在任务首次运行前占位替换正常周期任务，避免「按 interval
+    # 的那一轮」干扰「无租约不采样」断言（本组只验证实时任务的租约门控）
+    _col38._tasks["Srv"].cancel()
+    await asyncio.gather(_col38._tasks["Srv"], return_exceptions=True)
+    _col38._tasks["Srv"] = asyncio.create_task(asyncio.sleep(3600))
     # realtime_interval 改动即时生效（任务循环内实时读取）
     _col38.apply_settings("Srv", {"enabled": True, "ping_host": "mc.example.com",
                                   "realtime_interval": 3})
     assert _col38.status("Srv")["realtime_interval"] == 3
-    # 等后端实时任务自动采样（3s 间隔，最多等 7s）——不依赖任何前端循环
+    # 租约门控：没有实时视图在拉取时**不采样**——修复「设了 900 秒却每 5 秒
+    # 发一条 tps」的根因（此前实时任务 24 小时常驻高频采样）
+    assert _col38.status("Srv")["realtime_active"] is False
+    await asyncio.sleep(2)
+    assert _col38.store.sample_count("Srv") == 0, \
+        "无租约时实时任务不得采样（只按正常周期 interval 采样）"
+    # 仪表盘拉取实时曲线（touch_realtime 续约）→ 后端按 realtime_interval 采样
+    _col38.touch_realtime("Srv")
+    assert _col38.status("Srv")["realtime_active"] is True
     for _ in range(7):
         await asyncio.sleep(1)
         if _col38.store.sample_count("Srv") > 0:
             break
-    assert _col38.store.sample_count("Srv") > 0, "后端实时任务应在开启后自动采样"
+    assert _col38.store.sample_count("Srv") > 0, "续约后实时任务应开始采样"
     # 固定间隔调度：采样耗时被单调时钟补偿，相邻样本间隔 ≈ realtime_interval
     # （此前「采样+等待」的实际周期 = 采样耗时 + interval，60 秒窗口样本数
     # 永远到不了周期数，如 1s 设置 → 1.18s 实际周期 → 窗口约 51 个样本）
     _col38.apply_settings("Srv", {"realtime_interval": 1})
     _before38 = _col38.store.sample_count("Srv")
     for _ in range(8):
+        _col38.touch_realtime("Srv")  # 模拟前端每轮拉取持续续约
         await asyncio.sleep(1)
         if _col38.store.sample_count("Srv") >= _before38 + 4:
             break
@@ -4001,6 +4050,14 @@ async def _rt38():
     _med38 = sorted(_gaps38)[len(_gaps38) // 2] if _gaps38 else 0.0
     assert 0.6 < _med38 < 1.2, \
         f"固定间隔调度应≈1s（旧行为≈1.18s），实际中位间隔 {_med38:.2f}s"
+    # 租约到期（用户切走/关页面）：不再高频采样，交回正常周期
+    _col38._realtime_until["Srv"] = _time38.monotonic() - 1
+    await asyncio.sleep(1.5)  # 等在途采样收尾
+    assert _col38.status("Srv")["realtime_active"] is False
+    _after38 = _col38.store.sample_count("Srv")
+    await asyncio.sleep(2)
+    assert _col38.store.sample_count("Srv") == _after38, \
+        "租约到期后实时任务不得继续采样"
     # 尾部扫描（高频采样优化）：只返回 since_ts 之后的样本且保持旧→新
     _srv_dir = _mdir38 / "Srv"
     _srv_dir.mkdir(parents=True, exist_ok=True)
@@ -4022,7 +4079,8 @@ async def _rt38():
 
 
 _asyncio38.run(_rt38())
-print("OK  实时任务随 start 常驻 / 与正常周期同锁串行 / 设置即时生效 / 自动采样 / 尾部扫描窗口过滤与排序 / stop 全量取消")
+print("OK  实时任务随 start 常驻 / 租约门控（无租约不采样、到期即停） / 与正常周期同锁串行 / "
+      "设置即时生效 / 续约后自动采样 / 尾部扫描窗口过滤与排序 / stop 全量取消")
 
 print("\n=== 39. 面板级偏好长期存储（后端 panel_prefs.json） ===")
 from astrbot_plugin_minecraft_queqiao.services.panel_prefs import PanelPrefsStore as _PP39
@@ -7227,4 +7285,408 @@ assert ServerConfig.from_dict({"slp_address": " 1.2.3.4:25566 "}).slp_address ==
 )
 
 print("OK  探测地址解析/抖动静默/真启动通知/schema 全部通过")
+
+print("\n=== 60. 游戏聊天批量合并窗口（仅聊天 / 默认关闭 / 到点合并） ===")
+import asyncio as _asyncio60
+import time as _time60
+from astrbot_plugin_minecraft_queqiao.core.constants import (
+    DEFAULT_FORWARD_BATCH_SECONDS as _FBDEF60,
+    FORWARD_BATCH_MAX_LINES as _FBMAX60,
+)
+from astrbot_plugin_minecraft_queqiao.services.message_bridge import (
+    MessageBridge as _MB60,
+)
+
+# (a) 配置默认值与钳制：默认关闭、窗口 10 分钟、越界收回 1~3600
+_cfg60def = ServerConfig.from_dict({})
+assert _cfg60def.forward_batch_enabled is False, "默认关闭，升级不改变既有行为"
+assert _cfg60def.forward_batch_seconds == _FBDEF60 == 600
+assert ServerConfig.from_dict(
+    {"message": {"forward_batch_seconds": 0}}).forward_batch_seconds == 1
+assert ServerConfig.from_dict(
+    {"message": {"forward_batch_seconds": 99999}}).forward_batch_seconds == 3600
+assert ServerConfig.from_dict(
+    {"message": {"forward_batch_seconds": "abc"}}).forward_batch_seconds == 600
+_schema60 = json.loads(
+    pathlib.Path(__file__).with_name("_conf_schema.json").read_text(encoding="utf-8")
+)
+_mi60 = _schema60["mc_servers"]["templates"]["server"]["items"]["message"]["items"]
+assert _mi60["forward_batch_enabled"]["default"] is False
+assert _mi60["forward_batch_enabled"]["type"] == "bool"
+assert _mi60["forward_batch_seconds"]["default"] == 600
+assert _mi60["forward_batch_seconds"]["type"] == "int"
+
+_sent60: list[tuple[str, str]] = []
+
+
+class _Ctx60:
+    async def send_message(self, umo, chain):
+        _sent60.append((umo, "".join(getattr(c, "text", "") for c in chain.chain)))
+        return True
+
+
+def _chat60(name, msg):
+    return QueQiaoEvent.from_dict({
+        "event_name": "PlayerChatEvent", "message": msg,
+        "player": {"nickname": name},
+    })
+
+
+def _join60(name):
+    return QueQiaoEvent.from_dict({
+        "post_type": "notice", "event_name": "PlayerJoinEvent",
+        "player": {"nickname": name},
+    })
+
+
+def _cfg60(batch, seconds=600):
+    return ServerConfig.from_dict({
+        "server": {"server_name": "S60"},
+        "message": {
+            "target_sessions": ["umo:GroupMessage:60"],
+            "forward_chat_to_astrbot": True,
+            "forward_join_leave_to_astrbot": True,
+            "forward_chat_format": "{player}: {message}",
+            "forward_batch_enabled": batch,
+            "forward_batch_seconds": seconds,
+        },
+    })
+
+
+# (b) 关闭时：聊天即时单条转发（不产生窗口与定时任务）
+_cfg60a = _cfg60(False)
+_br60a = _MB60(_Ctx60())
+_br60a.register_server(_cfg60a)
+
+
+async def _off60():
+    assert await _br60a.forward_event("S60", _cfg60a, _chat60("A", "hi")) is True
+    return _br60a
+
+
+asyncio.run(_off60())
+assert len(_sent60) == 1 and _sent60[0][1] == "A: hi", _sent60
+assert not _br60a._batch_windows and not _br60a._batch_tasks
+
+# (c) 开启时：聊天进窗口不立即发；进出消息仍即时（不被延迟/淹没）
+_sent60.clear()
+_cfg60b = _cfg60(True, 3600)
+_br60b = _MB60(_Ctx60())
+_br60b.register_server(_cfg60b)
+
+
+async def _batch60():
+    assert await _br60b.forward_event("S60", _cfg60b, _chat60("A", "1")) is True
+    assert await _br60b.forward_event("S60", _cfg60b, _chat60("B", "2")) is True
+    assert _sent60 == [], "窗口内聊天不得立即发出"
+    assert "S60" in _br60b._batch_windows and "S60" in _br60b._batch_tasks
+    # 进出通知不受批量窗口影响
+    await _br60b.forward_event("S60", _cfg60b, _join60("C"))
+    assert len(_sent60) == 1 and "C" in _sent60[0][1], _sent60
+    # flush_all：合并成一条，按到达顺序换行拼接
+    assert await _br60b.flush_all() == 1
+    assert len(_sent60) == 2 and _sent60[1][1] == "A: 1\nB: 2", _sent60
+    assert not _br60b._batch_windows and not _br60b._batch_tasks
+    # 幂等：没有窗口时再 flush 不发空消息
+    assert await _br60b.flush_all() == 0 and len(_sent60) == 2
+
+
+asyncio.run(_batch60())
+
+# (d) 到点自动发出（窗口 1 秒）：不需要 flush_all
+_sent60.clear()
+_cfg60c = _cfg60(True, 1)
+_br60c = _MB60(_Ctx60())
+_br60c.register_server(_cfg60c)
+
+
+async def _timer60():
+    assert await _br60c.forward_event("S60", _cfg60c, _chat60("A", "x")) is True
+    assert _sent60 == [], "窗口未到点不应发出"
+    for _ in range(20):
+        await asyncio.sleep(0.2)
+        if _sent60:
+            break
+    return _br60c
+
+
+asyncio.run(_timer60())
+assert len(_sent60) == 1 and _sent60[0][1] == "A: x", _sent60
+assert not _br60c._batch_windows and not _br60c._batch_tasks
+
+# (e) 条数上限：超出部分只报数量，不把消息撑爆
+_sent60.clear()
+_cfg60d = _cfg60(True, 3600)
+_br60d = _MB60(_Ctx60())
+_br60d.register_server(_cfg60d)
+
+
+async def _cap60():
+    for _i in range(_FBMAX60 + 3):
+        assert await _br60d.forward_event(
+            "S60", _cfg60d, _chat60("A", f"m{_i}")) is True
+    await _br60d.flush_all()
+
+
+asyncio.run(_cap60())
+assert len(_sent60) == 1, _sent60
+_text60 = _sent60[0][1]
+assert "A: m0" in _text60 and f"A: m{_FBMAX60 - 1}" in _text60, "上限内应全部保留"
+assert f"A: m{_FBMAX60}" not in _text60, "超过条数上限的不得展开"
+assert "另有 3 条聊天未展开" in _text60, _text60
+
+# (f) clear()：丢弃未到点窗口并取消定时任务（热重载由 flush_all 先发）
+_sent60.clear()
+_cfg60e = _cfg60(True, 3600)
+_br60e = _MB60(_Ctx60())
+_br60e.register_server(_cfg60e)
+
+
+async def _clear60():
+    await _br60e.forward_event("S60", _cfg60e, _chat60("A", "z"))
+    _br60e.clear()
+    for _ in range(5):
+        await asyncio.sleep(0)
+    await asyncio.sleep(0.1)
+
+
+asyncio.run(_clear60())
+assert not _br60e._batch_windows and not _br60e._batch_tasks
+assert _sent60 == [], "clear() 后不得残留延迟发送"
+
+print("OK  默认关闭与钳制 / schema 同步 / 关闭即时转发 / 开启仅聊天入窗 / "
+      "进出不受影响 / flush_all 合并与幂等 / 到点自动发出 / 上限摘要 / clear 清理")
+
+print("=== 61. 指令原文不转发进游戏 + /mc status 人数兜底 ===")
+from astrbot_plugin_minecraft_queqiao.main import MinecraftQueQiaoPlugin as _P61
+from astrbot_plugin_minecraft_queqiao.handlers.commands import CommandHandler as _CH61
+from astrbot_plugin_minecraft_queqiao.core.models import (
+    PlayerListResult as _PLR61,
+    ServerStatus as _SS61,
+)
+from astrbot_plugin_minecraft_queqiao.services.renderer import InfoRenderer as _IR61
+
+
+class _CmdNames61:
+    def __init__(self, names):
+        self._names = list(names)
+
+    def get_complete_command_names(self):
+        return self._names
+
+
+class _Handler61:
+    def __init__(self, *names):
+        self.event_filters = [_CmdNames61(names)]
+
+
+class _Ev61:
+    def __init__(self, wake=True):
+        self.is_at_or_wake_command = wake
+
+
+_registry61 = types.ModuleType("astrbot.core.star.star_handler")
+_registry61.star_handlers_registry = [
+    _Handler61("mc", "mc status", "mc list"),
+    _Handler61("help"),
+]
+sys.modules["astrbot.core.star.star_handler"] = _registry61
+
+# (a) 命中已注册指令：指令原文不得转发进游戏
+assert _P61._is_bot_command_text(_Ev61(), "mc status") is True
+assert _P61._is_bot_command_text(_Ev61(), "mc status 2") is True
+assert _P61._is_bot_command_text(_Ev61(), "mc") is True
+assert _P61._is_bot_command_text(_Ev61(), "help") is True
+# (b) 词边界与唤醒语义：`mcstatus` / 未唤醒的普通聊天照常转发
+assert _P61._is_bot_command_text(_Ev61(), "mcstatus") is False
+assert _P61._is_bot_command_text(_Ev61(), "mc2 status") is False
+assert _P61._is_bot_command_text(_Ev61(wake=False), "mc status") is False
+assert _P61._is_bot_command_text(_Ev61(), "大家早") is False
+# (c) 注册表不可用（老版本 AstrBot / 导入失败）时按普通聊天放行
+sys.modules.pop("astrbot.core.star.star_handler", None)
+assert _P61._is_bot_command_text(_Ev61(), "mc status") is False
+sys.modules["astrbot.core.star.star_handler"] = _registry61
+
+
+class _Inst61:
+    """状态查询桩：get_status_model 由用例注入，fetch_player_list 记录调用。"""
+
+    def __init__(self, status, players=None):
+        self.config = ServerConfig.from_dict(
+            {"server": {"server_name": "S61", "display_name": "生电"}}
+        )
+        self.connected = True
+        self._status = status
+        self._players = players
+        self.fetch_calls = 0
+
+    async def get_status_model(self):
+        return self._status
+
+    async def fetch_player_list(self, status_model=None):
+        self.fetch_calls += 1
+        assert status_model is self._status, "应复用已拉取的状态模型"
+        return self._players
+
+
+class _SM61:
+    def __init__(self, inst):
+        self._inst = inst
+
+    def get(self, name):
+        return self._inst
+
+    def all(self):
+        return [self._inst]
+
+
+# (d) 鹊桥 SLP 失败 → 人数全 0：用 RCON list 补人数与名单
+_inst61 = _Inst61(
+    _SS61(server_type="PAPER", server_version="26.2", online_players=0, max_players=0),
+    _PLR61(
+        names=["tree", "kebee"], online=2, max=20,
+        source="rcon", rcon_channel="queqiao",
+    ),
+)
+_h61 = _CH61(_SM61(_inst61), None, _IR61(False))
+_text61 = asyncio.run(_h61.handle_status(None, "S61"))
+assert _inst61.fetch_calls == 1, _inst61.fetch_calls
+assert "在线：2/20" in _text61, _text61
+assert "tree" in _text61 and "kebee" in _text61, _text61
+
+
+# (e) SLP 正常（有 max）：不得额外执行 RCON list
+class _Inst61ok(_Inst61):
+    async def fetch_player_list(self, status_model=None):
+        raise AssertionError("SLP 正常时不应额外执行 RCON list")
+
+
+_inst61ok = _Inst61ok(
+    _SS61(
+        server_type="PAPER", online_players=3, max_players=20,
+        player_sample=[("Alex", "")],
+    )
+)
+_h61ok = _CH61(_SM61(_inst61ok), None, _IR61(False))
+_text61ok = asyncio.run(_h61ok.handle_status(None, "S61"))
+assert "在线：3/20" in _text61ok, _text61ok
+assert "Alex" in _text61ok, _text61ok
+
+# (f) RCON 也拿不到（source=none）：保持原样，不伪造人数
+_inst61none = _Inst61(
+    _SS61(server_type="PAPER", online_players=0, max_players=0),
+    _PLR61(source="none"),
+)
+_h61none = _CH61(_SM61(_inst61none), None, _IR61(False))
+_text61none = asyncio.run(_h61none.handle_status(None, "S61"))
+assert "在线：0/0" in _text61none, _text61none
+
+print("OK  指令命中不转发 / 词边界与唤醒判定 / 注册表缺失放行 / "
+      "SLP 失败补 RCON 人数 / SLP 正常不多发指令 / 全失败不伪造")
+
+print("=== 62. 监控在线人数以 RCON list 为准 ===")
+import time as _time62
+from astrbot_plugin_minecraft_queqiao.core.constants import (
+    MONITOR_ONLINE_RCON_TTL as _ORTTL62,
+)
+from astrbot_plugin_minecraft_queqiao.services.monitor import (
+    MonitorCollector as _MC62,
+)
+
+_mdir62 = pathlib.Path("/tmp/queqiao_test_monitor62")
+if _mdir62.exists():
+    import shutil as _shutil62
+    _shutil62.rmtree(_mdir62)
+_mdir62.mkdir(parents=True, exist_ok=True)
+
+
+class _Inst62:
+    """list 与 tps 返回不同输出的服务器桩。"""
+
+    def __init__(self, list_out):
+        self.connected = True
+        self._list_out = list_out
+        self.commands = []
+
+    async def execute_command_with_channel(self, command):
+        self.commands.append(command)
+        if command == "list":
+            return self._list_out, ("queqiao" if self._list_out is not None else "")
+        return "TPS from last 1m, 5m, 15m: 20.0, 20.0, 20.0", "queqiao"
+
+
+class _Ping62:
+    version_name = "Paper 1.20.4"
+    online = 0
+    max_players = 20
+    description = "A Minecraft Server"
+    rtt_ms = 5.0
+
+
+class _Ping62b(_Ping62):
+    online = 7
+
+
+async def _ping62(host, port, timeout=5.0):
+    return (_Ping62b() if host == "fallback.example.com" else _Ping62()), ""
+
+
+class _SM62:
+    def __init__(self):
+        self.insts = {}
+
+    def add(self, name, inst):
+        self.insts[name] = inst
+
+    def get(self, name):
+        return self.insts.get(name)
+
+
+_sm62 = _SM62()
+_inst62 = _Inst62("There are 4 of a max of 20 players online: tree, kebee, x, y")
+_inst62b = _Inst62(None)
+_sm62.add("S62", _inst62)
+_sm62.add("S62b", _inst62b)
+_col62 = _MC62(_mdir62, _sm62)
+
+
+async def _mon62():
+    _col62.start({
+        "S62": _SC35.from_dict({"server": {"server_name": "S62"}}),
+        "S62b": _SC35.from_dict({"server": {"server_name": "S62b"}}),
+    })
+    _col62.apply_settings("S62", {"ping_host": "mc.example.com"})
+    _col62.apply_settings("S62b", {"ping_host": "fallback.example.com"})
+    _col62._ping = _ping62
+    try:
+        # (a) SLP 报 0 人时，人数取 RCON list（服务端隐藏状态玩家数的场景）
+        await _col62._sample_once("S62", _col62._settings["S62"])
+        _lat62 = _col62.store.latest("S62")
+        assert _lat62.online == 4, _lat62
+        assert _lat62.tps1 == 20.0, "TPS 采样不受人数来源影响"
+        # (b) 缓存：TTL 内不重复发 list
+        await _col62._sample_once("S62", _col62._settings["S62"])
+        assert _inst62.commands.count("list") == 1, _inst62.commands
+        # (c) 缓存过期后重新取
+        _col62._online_cache["S62"] = (
+            _time62.monotonic() - _ORTTL62 - 1, 4,
+        )
+        await _col62._sample_once("S62", _col62._settings["S62"])
+        assert _inst62.commands.count("list") == 2, _inst62.commands
+        # (d) list 拿不到（未开 RCON / 超时）：回落到 SLP 人数
+        await _col62._sample_once("S62b", _col62._settings["S62b"])
+        assert _col62.store.latest("S62b").online == 7, "RCON 不可用时用 SLP 人数"
+        # (e) list 输出无法解析：同样回落 SLP，不写坏人数
+        _inst62b._list_out = "Unknown command."
+        _col62._online_cache.pop("S62b", None)
+        await _col62._sample_once("S62b", _col62._settings["S62b"])
+        assert _col62.store.latest("S62b").online == 7, "无法解析时不得写 0"
+    finally:
+        await _col62.stop()
+
+
+asyncio.run(_mon62())
+
+print("OK  list 优先于 SLP / TTL 缓存不刷指令 / 过期重新取 / "
+      "拿不到回落 SLP / 解析失败不写坏人数")
 

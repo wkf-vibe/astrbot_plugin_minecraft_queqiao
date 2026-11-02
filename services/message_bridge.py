@@ -8,9 +8,11 @@
   模组渲染（https://github.com/kitUIN/ChatImage）
 """
 
+import asyncio
 import json
 import re
 import time
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 from urllib.parse import unquote, urlparse
@@ -22,6 +24,9 @@ from ..core.constants import (
     DEFAULT_CHATIMAGE_NAME,
     ECHO_SUPPRESS_WINDOW,
     EMOJI_OK_GESTURE,
+    FORWARD_BATCH_MAX_CHARS,
+    FORWARD_BATCH_MAX_IMAGES,
+    FORWARD_BATCH_MAX_LINES,
     IMAGE_DOWNLOAD_TIMEOUT,
     MARK_TEXT_OK,
     MAX_IMAGE_DOWNLOAD_BYTES,
@@ -287,6 +292,20 @@ async def download_image_bytes(
     return data
 
 
+@dataclass
+class _BatchWindow:
+    """一段待合并的聊天：窗口从首条消息开始计时，到点整段发出。"""
+
+    server_name: str
+    targets: list[str]
+    seconds: int
+    lines: list[str] = field(default_factory=list)
+    images: list = field(default_factory=list)
+    chars: int = 0
+    # 超过条数/字数上限没塞进去的条数（只报数量，避免一条消息无限长）
+    dropped: int = 0
+
+
 class MessageBridge:
     """负责 MC 事件到外部会话的格式化与发送。"""
 
@@ -299,6 +318,10 @@ class MessageBridge:
         self._session_to_servers: dict[str, list[tuple[str, ServerConfig]]] = {}
         # (server_name, content) -> 转发时间，用于回声抑制
         self._recently_forwarded: dict[tuple[str, str], float] = {}
+        # server_name -> 正在攒的聊天窗口（批量合并，仅聊天）
+        self._batch_windows: dict[str, _BatchWindow] = {}
+        # server_name -> 到点发送的定时任务
+        self._batch_tasks: dict[str, asyncio.Task] = {}
 
     def register_server(self, config: ServerConfig) -> None:
         """注册服务器并建立目标会话的反向索引。"""
@@ -309,10 +332,33 @@ class MessageBridge:
                 entries.append((config.server_name, config))
 
     def clear(self) -> None:
-        """清空已注册服务器索引，供配置热重载前重置使用。"""
+        """清空已注册服务器索引，供配置热重载前重置使用。
+
+        未到点的合并窗口一并丢弃（热重载由 ``flush_all`` 负责先发出），
+        并取消对应定时任务，避免任务泄漏到新配置上。
+        """
+        for task in self._batch_tasks.values():
+            task.cancel()
+        self._batch_tasks.clear()
+        self._batch_windows.clear()
         self._configs.clear()
         self._session_to_servers.clear()
         self._recently_forwarded.clear()
+
+    async def flush_all(self) -> int:
+        """立即发出所有未到点的合并窗口（热重载/插件关闭时调用）。
+
+        返回实际发出的窗口数。发送失败只记日志，不影响调用方收尾。
+        """
+        names = list(self._batch_windows)
+        sent = 0
+        for name in names:
+            task = self._batch_tasks.pop(name, None)
+            if task is not None:
+                task.cancel()
+            if await self._flush_window(name):
+                sent += 1
+        return sent
 
     def servers_for_session(self, umo: str) -> list[tuple[str, ServerConfig]]:
         """查询某会话绑定的服务器列表。"""
@@ -487,6 +533,12 @@ class MessageBridge:
         if not content and not images:
             return False
 
+        # 批量合并窗口（仅聊天）：攒到窗口结束再统一发出，避免刷屏式逐条转发。
+        # 进出/死亡/成就仍即时单条发送——它们不该被延迟，也不该被聊天淹没
+        if event.is_chat and config.forward_batch_enabled:
+            self._buffer_chat(server_name, config, content, images)
+            return True
+
         sent_count = 0
         for umo in targets:
             if await self._send(umo, content, images):
@@ -496,6 +548,69 @@ class MessageBridge:
                 f"[{PLUGIN_NAME}][{server_name}] 游戏消息 → QQ: {content} "
                 f"(已发送 {sent_count}/{len(targets)} 个会话)"
             )
+        return sent_count > 0
+
+    # ---- 批量合并窗口（MC → 外部，仅聊天） ----
+
+    def _buffer_chat(
+        self,
+        server_name: str,
+        config: ServerConfig,
+        content: str,
+        images: list,
+    ) -> None:
+        """把一条聊天塞进当前窗口；首条消息时开启窗口并预约发送。"""
+        seconds = max(1, config.forward_batch_seconds)
+        window = self._batch_windows.get(server_name)
+        if window is None:
+            window = _BatchWindow(
+                server_name=server_name,
+                targets=list(config.target_sessions),
+                seconds=seconds,
+            )
+            self._batch_windows[server_name] = window
+            # 定时任务独立于事件链路：事件处理立刻返回，到点再统一发出
+            self._batch_tasks[server_name] = asyncio.create_task(
+                self._flush_after(server_name, seconds)
+            )
+        # 条数/字数上限：超出的只计数，合并消息末尾提示「另有 N 条」
+        if (
+            len(window.lines) >= FORWARD_BATCH_MAX_LINES
+            or window.chars + len(content) > FORWARD_BATCH_MAX_CHARS
+        ):
+            window.dropped += 1
+            return
+        window.lines.append(content)
+        window.chars += len(content)
+        if images and len(window.images) < FORWARD_BATCH_MAX_IMAGES:
+            window.images.extend(images[: FORWARD_BATCH_MAX_IMAGES - len(window.images)])
+
+    async def _flush_after(self, server_name: str, seconds: int) -> None:
+        """等待窗口到期后发送；被取消（clear/flush_all）时静默退出。"""
+        try:
+            await asyncio.sleep(seconds)
+        except asyncio.CancelledError:
+            raise
+        self._batch_tasks.pop(server_name, None)
+        await self._flush_window(server_name)
+
+    async def _flush_window(self, server_name: str) -> bool:
+        """把某台服务器当前窗口合并成一条消息发出（幂等：窗口已空返回 False）。"""
+        window = self._batch_windows.pop(server_name, None)
+        if window is None or (not window.lines and not window.images):
+            return False
+        text = "\n".join(window.lines)
+        if window.dropped:
+            text += f"\n…（另有 {window.dropped} 条聊天未展开）"
+        sent_count = 0
+        for umo in window.targets:
+            if await self._send(umo, text, window.images):
+                sent_count += 1
+        logger.info(
+            f"[{PLUGIN_NAME}][{window.server_name}] 合并转发聊天 "
+            f"{len(window.lines)} 条（窗口 {window.seconds}s）→ QQ "
+            f"(已发送 {sent_count}/{len(window.targets)} 个会话)"
+        )
         return sent_count > 0
 
     async def _send(self, umo: str, content: str, images: list | None = None) -> bool:

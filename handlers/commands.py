@@ -294,6 +294,16 @@ class CommandHandler:
             return f"❌ 服务器 {label} 未连接鹊桥"
 
         status = await instance.get_status_model()
+        # 鹊桥自身的 SLP 探测失败时（如它对 0.0.0.0 发 ping 超时），
+        # get_status 的 players 全为 0，会显示成「在线 0/0」；此时用 RCON
+        # `list` 补人数与名单（另一种查询，不违反「超时 ≠ 失败，禁止重发」）
+        if status is not None and status.max_players <= 0:
+            players = await instance.fetch_player_list(status_model=status)
+            if players.source != "none":
+                status.online_players = players.online
+                status.max_players = players.max or status.max_players
+                if players.names:
+                    status.player_sample = [(name, "") for name in players.names]
         # 性能监控的最近采样（TPS 三档 / API 延迟），与实时状态查询相互独立；
         # 未启用监控或尚无采样时为 None，渲染层自动省略
         latest = self._monitor.store.latest(server_name) if self._monitor else None

@@ -327,6 +327,8 @@ class MinecraftQueQiaoPlugin(Star):
         清空索引后重新应用，使服务器列表/条目/开关的改动全部生效。
         """
         logger.info(f"[{PLUGIN_NAME}] 配置已更新，正在热重载...")
+        # 未到点的聊天合并窗口先发出去，避免热重载把攒着的聊天丢掉
+        await self.message_bridge.flush_all()
         await self._stop_runtime()
         self._configs.clear()
         self.message_bridge.clear()
@@ -359,6 +361,9 @@ class MinecraftQueQiaoPlugin(Star):
             with contextlib.suppress(asyncio.CancelledError):
                 await self._init_task
 
+        # 关停前把未到点的聊天合并窗口发出去（吞掉会静默丢失玩家聊天）
+        with contextlib.suppress(Exception):
+            await self.message_bridge.flush_all()
         await self._stop_runtime()
         logger.info(f"[{PLUGIN_NAME}] 已关闭")
 
@@ -1030,9 +1035,52 @@ class MinecraftQueQiaoPlugin(Star):
                     event.stop_event()
                     return
 
+        # AstrBot 指令（如 `/mc status`）同样会进入本监听：指令原文不能当聊天
+        # 转发进游戏，否则 MC 聊天栏会刷出「mc status」这类无意义内容
+        if text and self._is_bot_command_text(event, text):
+            return
+
         # 转发到 MC
         if await self._relay_to_minecraft(event, umo, text, images):
             event.stop_event()
+
+    @staticmethod
+    def _is_bot_command_text(event: AstrMessageEvent, text: str) -> bool:
+        """判断文本是否命中一个已注册的 AstrBot 指令。
+
+        本插件的 `event_message_type(ALL)` 监听与指令处理器并行执行：
+        `/mc status` 这类指令被 AstrBot 解析执行的同时也会走到转发逻辑，
+        若不排除，指令去掉了斜杠后的原文会被当作普通聊天发进游戏。
+
+        指令名从 AstrBot 的处理器注册表实时读取（含指令组的子指令完整名），
+        因此不需要在本插件里重复维护指令清单；注册表不可用时按「不是指令」
+        处理，保证转发功能不受影响。
+        """
+        if not getattr(event, "is_at_or_wake_command", False):
+            return False
+        normalized = re.sub(r"\s+", " ", text.strip())
+        if not normalized:
+            return False
+        try:
+            from astrbot.core.star.star_handler import star_handlers_registry
+        except (ImportError, AttributeError):
+            return False
+        for handler_md in list(star_handlers_registry):
+            for handler_filter in getattr(handler_md, "event_filters", None) or []:
+                names_getter = getattr(
+                    handler_filter, "get_complete_command_names", None
+                )
+                if not callable(names_getter):
+                    continue
+                try:
+                    names = names_getter() or []
+                except Exception:  # 第三方过滤器实现可能抛任意异常，跳过即可
+                    continue
+                for name in names:
+                    # 词边界匹配：`mc status` 命中，`mcstatus`/`mc2` 不命中
+                    if normalized == name or normalized.startswith(f"{name} "):
+                        return True
+        return False
 
     @staticmethod
     def _extract_images(event: AstrMessageEvent) -> list:

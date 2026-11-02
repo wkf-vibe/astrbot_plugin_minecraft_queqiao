@@ -77,6 +77,19 @@ ECHO_SUPPRESS_WINDOW = 5.0
 DEFAULT_CHAT_FORMAT = "[{display_name}]{player}: {message}"
 DEFAULT_BROADCAST_FORMAT = "[{platform}]{sender}: {message}"
 
+# ---- 游戏 → 外部：聊天批量合并窗口 ----
+# 从窗口内首条消息开始计时，到点把窗口内所有聊天合并成一条发出（滚动窗口
+# 只在首条消息时开一次，不做「每来一条就顺延」——否则连续聊天永远发不出去）。
+# 默认关闭：升级不改变既有转发行为；窗口默认 600 秒（10 分钟）
+DEFAULT_FORWARD_BATCH_ENABLED = False
+DEFAULT_FORWARD_BATCH_SECONDS = 600
+FORWARD_BATCH_SECONDS_MIN = 1
+FORWARD_BATCH_SECONDS_MAX = 3600
+# 合并后的单条消息上限：聊天刷屏时不能把一整天的内容塞进一条消息
+FORWARD_BATCH_MAX_LINES = 30
+FORWARD_BATCH_MAX_CHARS = 1500
+FORWARD_BATCH_MAX_IMAGES = 9
+
 # 服务器连通通知（notify_on_connect）的默认文案：连接建立（含断线重连、
 # 插件热重载）时发往该服务器的目标会话。可用占位符 {display_name} / {server_name}
 DEFAULT_CONNECT_NOTIFY_FORMAT = "[{display_name}] 🟢 服务器已启动"
@@ -226,6 +239,14 @@ MONITOR_MIN_INTERVAL = 10
 DEFAULT_MONITOR_REALTIME_INTERVAL = 5
 MONITOR_REALTIME_MIN = 1
 MONITOR_REALTIME_MAX = 60
+# 实时采样租约（秒）：只有仪表盘真的在拉实时曲线时才高频采样。每次拉取
+# 续约一次，租约到期即回到正常周期（interval，如 900 秒）——避免「设了
+# 900 秒却每 5 秒发一条 tps」的常驻高频采样。租约至少覆盖 2 个拉取周期，
+# 否则前端轮询稍慢就断采
+MONITOR_REALTIME_LEASE_MIN = 20.0
+MONITOR_REALTIME_LEASE_FACTOR = 2.5
+# 租约到期后的检查周期：1 秒足够让「切到实时视图」在 1 秒内开始采样
+MONITOR_REALTIME_IDLE_POLL = 1.0
 # 互通终端默认加载最近几天的分片（含当天）：避免一次拉取 30 天全量。
 # 属每台服务器独立配置：面板「互通终端」天数写入 conf 条目顶层（与
 # enable_ai_chat 平级），Web API 拉日志时由前端按当前服务器传入
@@ -241,6 +262,10 @@ MONITOR_AUTO_REFRESH_MAX = 3600
 # 延迟采样专用的 get_status 响应超时。比 API_TIMEOUT(10s) 更短：
 # 延迟采不到时不值得为一个指标干等 10 秒（TPS 与状态另有来源）
 MONITOR_API_TIMEOUT = 5
+# 在线人数的 RCON `list` 结果缓存时长（秒）。实时视图下每 5 秒就要采样一次，
+# 逐轮发 `list` 只会刷服务端控制台；人数变化没这么快，60 秒足够新鲜，
+# 且小于常规采集间隔（>=10 秒的下限也走缓存，避免密集轮询）
+MONITOR_ONLINE_RCON_TTL = 60
 
 
 def prefix_matches(prefix: str, text: str) -> bool:

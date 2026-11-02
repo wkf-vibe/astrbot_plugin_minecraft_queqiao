@@ -46,12 +46,17 @@ from ..core.constants import (
     MONITOR_AUTO_REFRESH_MAX,
     MONITOR_AUTO_REFRESH_MIN,
     MONITOR_MIN_INTERVAL,
+    MONITOR_ONLINE_RCON_TTL,
+    MONITOR_REALTIME_IDLE_POLL,
+    MONITOR_REALTIME_LEASE_FACTOR,
+    MONITOR_REALTIME_LEASE_MIN,
     MONITOR_REALTIME_MAX,
     MONITOR_REALTIME_MIN,
     PLUGIN_NAME,
 )
 from ..core.models_config import ServerConfig
-from .slp_ping import brand_from_slp, mc_ping
+from ..core.rcon_client import RconClient
+from .slp_ping import brand_from_slp, mc_ping_ex
 
 if TYPE_CHECKING:
     from ..core.server_manager import ServerManager
@@ -65,6 +70,10 @@ _TPS_RE = re.compile(
 # 兜底：无前缀的旧版输出（行内恰好三个逗号分隔的浮点数），但必须处于
 # TPS 语境，避免把玩家名/其它数字行误判为 TPS
 _TPS_BARE_RE = re.compile(r"([\d.]+)\s*,\s*([\d.]+)\s*,\s*([\d.]+)")
+# MC 格式化代码（§6 / §a / §r）：Paper 的 tps 输出形如
+# `§6TPS from last 1m, 5m, 15m: §a20.0§r, §a20.0§r, §a20.0`
+# 颜色码夹在数字之间会切断正则，必须先整段剥离再解析
+_FORMAT_CODE_RE = re.compile(r"§.")
 # server_name 转安全文件名：仅保留字母数字、_、-、.，其余替换为 _
 _SAFE_NAME_RE = re.compile(r"[^A-Za-z0-9_.\-]+")
 
@@ -81,13 +90,14 @@ def parse_tps(output: str | None) -> tuple[float, float, float] | None:
 
     兼容格式：
     - Paper/Spigot：``TPS from last 1m, 5m, 15m: 20.0, 20.0, 20.0``
+    - Paper 带颜色码：``§6TPS from last 1m, 5m, 15m: §a20.0§r, §a20.0§r, §a20.0``
     - spark：前缀带装饰（如 ``⏱  TPS from last...``），同一正则命中
     - 旧版裸三数（前提是行内含 "TPS" 字样，避免误伤其它输出）
     - 原版端 ``Unknown command`` / 指令被拒 → None
     """
     if not output:
         return None
-    text = output.strip()
+    text = _FORMAT_CODE_RE.sub("", output).strip()
     matched = _TPS_RE.search(text)
     if matched:
         return tuple(float(group) for group in matched.groups())
@@ -657,10 +667,17 @@ class MonitorCollector:
         self.server_manager = server_manager
         self._tasks: dict[str, asyncio.Task] = {}
         self._errors: dict[str, str] = {}
+        # TPS 与延迟的错误分开记录：此前 `tps_error or latency_error` 会
+        # 用 TPS 错误盖掉延迟错误，延迟长期失败时界面上看不出任何提示
+        self._tps_errors: dict[str, str] = {}
+        self._latency_errors: dict[str, str] = {}
+        # server_name -> (monotonic 时刻, RCON list 得到的人数)：在线人数以
+        # RCON 为准，但实时视图每 5 秒一轮，逐轮发 list 只会刷服务端控制台
+        self._online_cache: dict[str, tuple[float, int]] = {}
         # start 时传入的 server_name -> ServerConfig：延迟探测主机解析等需要
         self._configs: dict[str, ServerConfig] = {}
-        # SLP 直连 ping 实现；测试可替换注入
-        self._ping = mc_ping
+        # SLP 直连 ping 实现（返回 (结果, 失败原因)）；测试可替换注入
+        self._ping = mc_ping_ex
         # server_name -> 最近一次 SLP ping 识别到的服务端品牌（如 "forge"），
         # 供 auto 模式的 TPS 指令解析使用；随时间推移自动更新
         self._server_types: dict[str, str] = {}
@@ -673,8 +690,11 @@ class MonitorCollector:
         self._sample_locks: dict[str, asyncio.Lock] = {}
         # server_name -> 实时采样常驻任务：与 _loop 同架构（后端驱动，不依赖
         # 浏览器），间隔独立取 realtime_interval（1~60 秒，设置即时生效）。
-        # 前端实时模式只按同一频率拉取展示，采样循环完全由后端保证连续性
+        # **只在仪表盘真的在拉实时曲线时才采样**（租约，见 touch_realtime）：
+        # 否则「设了 900 秒却每 5 秒发一条 tps」，白白加重服务端负担
         self._realtime_tasks: dict[str, asyncio.Task] = {}
+        # server_name -> 实时采样租约到期时刻（monotonic 秒）
+        self._realtime_until: dict[str, float] = {}
 
     def _lock_for(self, name: str) -> asyncio.Lock:
         """获取（必要时创建）某台服务器的采样互斥锁。"""
@@ -729,10 +749,34 @@ class MonitorCollector:
         tasks = list(self._tasks.values()) + list(self._realtime_tasks.values())
         self._tasks.clear()
         self._realtime_tasks.clear()
+        self._realtime_until.clear()
         for task in tasks:
             task.cancel()
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
+
+    # ---- 实时采样租约 ----
+
+    def realtime_lease_seconds(self, name: str) -> float:
+        """实时采样租约时长：至少覆盖 2.5 个拉取周期（前端按 realtime_interval 拉）。"""
+        settings = self._settings.get(name)
+        interval = settings.realtime_interval if settings else DEFAULT_MONITOR_REALTIME_INTERVAL
+        return max(MONITOR_REALTIME_LEASE_MIN, interval * MONITOR_REALTIME_LEASE_FACTOR)
+
+    def touch_realtime(self, name: str) -> bool:
+        """续约某台服务器的实时采样租约（仪表盘正在拉实时曲线时调用）。
+
+        返回该服务器是否已接入监控（未知服务器返回 False，由调用方决定是否
+        报 404）。租约到期后实时任务不再采样，只按正常周期（interval）采样。
+        """
+        if name not in self._settings:
+            return False
+        self._realtime_until[name] = time.monotonic() + self.realtime_lease_seconds(name)
+        return True
+
+    def realtime_active(self, name: str) -> bool:
+        """该服务器当前是否有实时视图在拉取（租约未到期）。"""
+        return self._realtime_until.get(name, 0.0) > time.monotonic()
 
     # ---- 运行时设置（来自仪表盘页面，不走 conf schema） ----
 
@@ -792,23 +836,32 @@ class MonitorCollector:
             await asyncio.sleep(max(MONITOR_MIN_INTERVAL, settings.interval))
 
     async def _realtime_loop(self, name: str) -> None:
-        """实时采样常驻任务：与正常周期 _loop 同一把互斥锁串行。
+        """实时采样任务：**只在仪表盘实时视图拉取期间**高频采样。
 
-        采样循环完全由后端驱动（与 _loop 同架构，不依赖浏览器 JS 链），
-        间隔独立取 ``realtime_interval``（1~60 秒，``apply_settings`` 改动
-        即时生效，无需重启任务）。前端实时模式只按同一频率拉取 series
-        展示；``enabled`` 关闭时任务空转，重新开启即刻恢复采集。
+        采样循环由后端驱动（与 _loop 同架构，不依赖浏览器 JS 链），间隔取
+        ``realtime_interval``（1~60 秒，``apply_settings`` 改动即时生效）。
 
-        **固定间隔调度**：用单调时钟补偿采样耗时——「采样 0.18s + 等 1s」
-        的实际周期是 1.18s，60 秒窗口只装得下约 51 个样本、永远到不了
-        60；改为「采样后只补足到整周期」，严格每 interval 秒一次，窗口
-        样本数 = 周期数。采样耗时超过周期时不堆积，立即续跑下一轮。
+        是否采样由**租约**决定（``touch_realtime``，每次拉取实时曲线续约）：
+        - 租约有效：按 ``realtime_interval`` 严格等间隔采样（见下方固定间隔
+          调度说明）；
+        - 租约到期（用户切走/关页面）：停止高频采样，只按 ``MONITOR_REALTIME_IDLE_POLL``
+          醒来检查租约，把采样完全交回正常周期 ``_loop``（interval，如 900 秒）。
+          这是「设了 900 秒却每 5 秒发一条 tps」的修复点。
+
+        **固定间隔调度**：用单调时钟补偿采样耗时——「采样 0.18s + 等 1s」的
+        实际周期是 1.18s，60 秒窗口只装得下约 51 个样本、永远到不了 60；
+        改为「采样后只补足到整周期」，严格每 interval 秒一次，窗口样本数 =
+        周期数。采样耗时超过周期时不堆积，立即续跑下一轮。
         """
         while True:
             settings = self._settings.get(name)
             if settings is None or not settings.enabled:
                 # 关闭状态：空转等待，随时可被 apply_settings 唤醒（即时生效）
                 await asyncio.sleep(60)
+                continue
+            if not self.realtime_active(name):
+                # 没有实时视图在拉取：不做任何 TPS/延迟探测，只等租约
+                await asyncio.sleep(MONITOR_REALTIME_IDLE_POLL)
                 continue
             round_start = time.monotonic()
             try:
@@ -839,12 +892,16 @@ class MonitorCollector:
         # TPS（RCON）与延迟（直连 SLP ping）走不同通道，并行采样互不拖累
         tps_task = asyncio.create_task(self._sample_tps(instance, tps_command))
         lat_task = asyncio.create_task(self._sample_latency(name, settings))
+        online_task = asyncio.create_task(self._sample_online(instance, name))
         tps, tps_error = await tps_task
         ping, latency_ms, latency_error = await lat_task
+        online = await online_task
 
         sample = MonitorSample(
             ts=time.time(),
-            online=ping.online if ping else 0,
+            # 人数以 RCON `list` 为准：SLP 状态查询会因服务端隐藏玩家数或超时
+            # 永远返回 0，曲线就失去意义；RCON 不可用时才回落到 SLP
+            online=online if online is not None else (ping.online if ping else 0),
             tps1=tps[0] if tps else None,
             tps5=tps[1] if tps else None,
             tps15=tps[2] if tps else None,
@@ -852,9 +909,19 @@ class MonitorCollector:
         )
         self.store.append(name, sample)
 
-        error = tps_error or latency_error
-        if error:
-            self._errors[name] = error
+        if tps_error:
+            self._tps_errors[name] = tps_error
+        else:
+            self._tps_errors.pop(name, None)
+        if latency_error:
+            self._latency_errors[name] = latency_error
+        else:
+            self._latency_errors.pop(name, None)
+        # 两类错误都要展示：此前用 `tps_error or latency_error` 二选一，TPS
+        # 失败时延迟的失败原因被完全掩盖（反之亦然）
+        errors = [err for err in (tps_error, latency_error) if err]
+        if errors:
+            self._errors[name] = "；".join(errors)
         else:
             self._errors.pop(name, None)
 
@@ -872,6 +939,29 @@ class MonitorCollector:
         if parsed is None:
             return None, f"TPS 输出无法解析: {output[:60]!r}"
         return parsed, None
+
+    async def _sample_online(self, instance: Any, name: str) -> int | None:
+        """经 RCON ``list`` 取在线人数（权威口径）；拿不到返回 None。
+
+        SLP 状态查询会被服务端隐藏玩家数（Paper 的 hide-online-players）
+        或直接超时，采到的人数常年是 0；``list`` 与面板玩家列表同源。
+        结果缓存 ``MONITOR_ONLINE_RCON_TTL`` 秒：实时视图每 5 秒采样一轮，
+        逐轮发 ``list`` 只会刷服务端控制台，人数变化没这么快。
+
+        ``list`` 超时属「结果未知」：不换通道重发，直接回落到 SLP 人数。
+        """
+        cached = self._online_cache.get(name)
+        now = time.monotonic()
+        if cached is not None and now - cached[0] < MONITOR_ONLINE_RCON_TTL:
+            return cached[1]
+        output, _ = await instance.execute_command_with_channel("list")
+        if output is None:
+            return None
+        online, _cap, _names = RconClient.parse_list_output(output)
+        if online is None:
+            return None
+        self._online_cache[name] = (now, online)
+        return online
 
     def _resolve_ping_target(self, name: str, settings: MonitorSettings) -> tuple[str, int] | None:
         """解析直连延迟探测目标 (host, port)。
@@ -925,7 +1015,8 @@ class MonitorCollector:
 
         延迟 = 玩家视角的**直连网络延迟**（SLP 握手 + 状态请求往返），
         不经鹊桥中转。成功时顺带缓存服务端品牌（供 auto 模式 TPS 指令
-        解析）与在线人数；失败/超时返回 None 并记录错误，不影响 TPS 采样。
+        解析）与在线人数；失败/超时返回 None 并记录**具体**原因
+        （连接被拒 / 超时 / 响应不是 MC 状态协议），不影响 TPS 采样。
         """
         target = self._resolve_ping_target(name, settings)
         if target is None:
@@ -935,17 +1026,13 @@ class MonitorCollector:
             )
         host, port = target
         try:
-            ping = await self._ping(host, port, timeout=MONITOR_API_TIMEOUT)
+            ping, reason = await self._ping(host, port, timeout=MONITOR_API_TIMEOUT)
         except asyncio.CancelledError:
             raise
-        except Exception:
-            return None, None, f"延迟未采到：直连 {host}:{port} 异常"
+        except Exception as exc:
+            return None, None, f"延迟未采到：直连 {host}:{port} 异常: {exc}"
         if ping is None:
-            return None, None, (
-                f"延迟未采到：直连 {host}:{port} 失败——连接拒绝/超时，或"
-                "响应不是 MC 状态协议（请确认该端口是 MC 游戏端口，且服务端"
-                "未禁用状态查询 enable-status=false）"
-            )
+            return None, None, f"延迟未采到：{reason}"
         brand = brand_from_slp(ping.version_name, ping.description)
         if brand:
             self._server_types[name] = brand
@@ -1008,11 +1095,15 @@ class MonitorCollector:
             "ping_target": f"{ping_target[0]}:{ping_target[1]}" if ping_target else None,
             "default_tab": settings.default_tab,
             "realtime_interval": settings.realtime_interval,
+            # 实时视图是否正在拉取（租约未到期）：未拉取时只有正常周期采样
+            "realtime_active": self.realtime_active(name),
             "auto_refresh_interval": settings.auto_refresh_interval,
             "running": bool(task and not task.done() and settings.enabled),
             "sample_count": self.store.sample_count(name),
             "last_ts": latest.ts if latest else None,
             "last_error": self._errors.get(name),
+            "last_tps_error": self._tps_errors.get(name),
+            "last_latency_error": self._latency_errors.get(name),
             "latest": latest.to_dict() if latest else None,
         }
 
@@ -1021,4 +1112,6 @@ class MonitorCollector:
         同时重置最近采样错误——界面计数立即归零，采集任务下一轮重头累计。"""
         removed = self.store.clear(name)
         self._errors.pop(name, None)
+        self._tps_errors.pop(name, None)
+        self._latency_errors.pop(name, None)
         return removed

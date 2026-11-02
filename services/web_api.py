@@ -2099,6 +2099,11 @@ class WebApiController:
 
         range_hours, bucket_seconds = self._parse_monitor_window()
         since_ts = time.time() - range_hours * 3600
+        # 实时视图（前端带 realtime=1，或时间窗 ≤ 6 分钟）：续约实时采样。
+        # 实时采样只在租约有效时高频跑，离开实时视图后自动回到正常周期，
+        # 避免「设了 900 秒却每 5 秒发一条 tps」
+        if self._is_realtime_request(range_hours):
+            self.monitor.touch_realtime(server_name)
         # 实时 1 分钟窗口每秒 1 点：边界处样本数可为 60 或 61，按窗口秒数
         # 截断到最近 N 个点，统计卡与曲线稳定显示 60（正常长窗口采样数远
         # 小于上限，永不触发截断）
@@ -2114,6 +2119,17 @@ class WebApiController:
                 "series": series,
             }
         )
+
+    @staticmethod
+    def _is_realtime_request(range_hours: float) -> bool:
+        """本次 series 请求是否来自实时视图（显式 realtime=1 或极短时间窗）。"""
+        try:
+            flag = str(request.query.get("realtime", "")).strip().lower()
+        except (AttributeError, ValueError, TypeError):
+            flag = ""
+        if flag in ("1", "true", "yes", "on"):
+            return True
+        return range_hours <= 0.1
 
     @staticmethod
     def _parse_monitor_window() -> tuple[float, int]:

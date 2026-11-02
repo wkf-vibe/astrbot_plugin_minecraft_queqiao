@@ -2844,7 +2844,13 @@ class DashboardApp {
         this.apiGet(
           `monitor/${encodeURIComponent(serverName)}/series`,
           isRealtime
-            ? { range: '1m', bucket: `${Math.max(1, Math.min(30, this.realtimeInterval || 5))}s` }
+            ? {
+                range: '1m',
+                bucket: `${Math.max(1, Math.min(30, this.realtimeInterval || 5))}s`,
+                // 续约后端实时采样租约：只有实时视图在拉取时才高频采样，
+                // 离开后自动回到「设置里的采集间隔」
+                realtime: 1,
+              }
             : { range: `${this.monitorRange}h` }
         ),
         new Promise((_, reject) =>
@@ -3969,11 +3975,12 @@ class DashboardApp {
     }
   }
 
-  // 实时模式：采样循环由**后端常驻任务**驱动（与正常周期同架构，间隔取
-  // realtime_interval，1~60 秒——后端任务保证连续性，不依赖浏览器）。
-  // 前端只负责按同一频率拉取最近 60 秒 series 并重绘曲线；setInterval
-  // 周期刷新（拉取挂起时 loadMonitorSeries 自带 8s 超时与防重入锁，
-  // 下一轮照常执行，不堆积）
+  // 实时模式：采样循环由**后端任务**驱动（与正常周期同架构，间隔取
+  // realtime_interval，1~60 秒）。后端只在「仪表盘正在拉实时曲线」期间
+  // 高频采样（每次本页拉取都续约，离开/关页面后租约到期即停），平时严格
+  // 按设置里的采集间隔采样。前端只负责按同一频率拉取最近 60 秒 series 并
+  // 重绘曲线；setInterval 周期刷新（拉取挂起时 loadMonitorSeries 自带 8s
+  // 超时与防重入锁，下一轮照常执行，不堆积）
   startRealtime() {
     // 代次递增：旧刷新链（若 await 挂起中）完成后因 round 不匹配自然退出，
     // 新链从本轮开始——重切实时按钮永远能重启，避免哑火

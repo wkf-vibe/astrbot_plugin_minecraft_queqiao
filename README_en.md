@@ -11,6 +11,7 @@
 Connects Minecraft servers to AstrBot through the [QueQiao](https://github.com/17TheWord/QueQiao) mod, bridging group chat with in-game chat and providing server management.
 
 - **Chat bridge**: two-way forwarding between in-game chat and group messages; replying to a game message forwarded by the bot automatically prepends `@原玩家名` (the original player name) in-game, so everyone sees who replied
+- **Batched chat forwarding**: optionally collect in-game chat for a while and send it to the group as one merged message, so busy chat no longer floods the group (off by default, window length configurable)
 - **Image forwarding**: group images relayed into the game (players need the [ChatImage](https://github.com/kitUIN/ChatImage) mod installed to render them); in-game images / links are downloaded and sent back to the group
 - **Event broadcast**: player join / quit / death / achievement events forwarded to sessions (death & achievements unsupported on Vanilla/Velocity)
 - **Quiet hours**: give each server a silent window (e.g. `23:00`–`08:00`) that mutes the game message types and connection notices you pick, so nothing pings the group overnight
@@ -37,6 +38,8 @@ Connects Minecraft servers to AstrBot through the [QueQiao](https://github.com/1
 | `/mc servers` | Everyone | List configured servers and connection state |
 
 When several servers are configured, prefix the command with a number to pick the target (e.g. `mc cmd 1 time set day` targets the first server); with one server it can be omitted. Run `mc servers` to see each server's number.
+
+Commands stay between you and the bot: `/mc status`, `/mc list` and the like are no longer echoed into the in-game chat as "mc status", while normal group chat keeps being forwarded.
 
 `mc status` / `mc list` also support **direct address query**: pass a `host:port` instead (e.g. `mc status 127.0.0.1:25565`) and the plugin queries **any** server directly over the Minecraft SLP protocol (version, online count, latency, MOTD, player names) with no QueQiao or config needed. When the port is omitted it defaults to `25565`.
 
@@ -134,10 +137,14 @@ The “⚙ 设置” button at the top right (next to the auto-refresh toggle) o
 | `forward_image_to_mc` | bool | `false` | Relay group images into the game (requires ChatImage on the client to render; otherwise the CICode text is shown) |
 | `chatimage_name` | string | `图片` | In-game display name for the image |
 | `forward_image_from_mc` | bool | `false` | In-game images (CICode / links) downloaded and sent back as images |
+| `forward_batch_enabled` | bool | `false` | Batched chat forwarding: collect chat within the window and send it as one merged message (chat only; join / quit / death / achievement stay instant) |
+| `forward_batch_seconds` | int | `600` | Merge window length in seconds (`1`–`3600`): starts at the first chat in the window and sends everything at the deadline; new messages do not extend it |
 
 > Get a session's UMO with **AstrBot's built-in `/sid` command**: send `/sid` in the target group/DM, and the `UMO` field in the reply is the value to fill in (e.g. `aiocqhttp:GroupMessage:123456789`). This list drives three things at once: which sessions receive MC messages, which sessions' messages are relayed into MC, and which server the `mc` commands issued in that session belong to.
 
 > `mark_option: emoji` adds a reaction to the **original message** that triggered the relay (no extra message is sent); every aiocqhttp protocol implementation (NapCat, Lagrange, LLOneBot, etc.) supports it, other platforms are skipped silently.
+
+> With **batched chat forwarding** (`forward_batch_enabled`) enabled, in-game chat is no longer relayed message by message: the window starts at the first chat, and everything collected until the deadline is sent as one merged message (window length `forward_batch_seconds`, default 600 s = 10 minutes). Only chat is batched — join / quit / death / achievement events are still sent immediately. A merged message expands at most 30 lines; anything beyond that is summarised as "…N more messages". Pending batches are flushed before a hot reload or shutdown, so no chat is lost.
 
 Common `mark_emoji_id` values:
 
@@ -359,14 +366,17 @@ TPS and latency monitoring are **enabled by default, zero-config**: a background
 | Parameter | Default | Description |
 |-----------|---------|-------------|
 | Enable switch | `on` | Stops sampling when off |
-| Sample interval | `60` s | Minimum `10` s |
+| Sample interval | `60` s | Minimum `10` s; the normal sampling rate |
+| Realtime rate | `5` s | `1`–`60` s; sampled at this rate **only while the dashboard's "realtime" view is open**, and falls back to the sample interval when you leave or close the page |
 | Retention | `7` days | Older samples pruned automatically |
 | TPS command | `auto` | Auto-picks by server brand (Forge → `forge tps`; Fabric/Quilt → `spark tps`; Bukkit forks → `tps`); may be pinned manually |
 | Latency domain | empty | Public address of the MC server (may include a port, e.g. `mc.example.com:25565`) for player-perspective latency; empty disables latency probing |
 
 - **TPS**: parsed from a TPS command executed over RCON — the server must support the command (Vanilla reports it as unavailable)
-- **Latency**: direct-connect Minecraft SLP ping (no QueQiao relay, no RCON) — a public probe address must be filled in Settings; servers with SLP disabled or unreachable addresses report latency as unavailable
-- Samples are stored per-day under `data_dir/monitor/` and survive restarts; `/mc status` also shows the latest samples
+- **Online players**: taken from RCON `list` (the same source as the player list), so the real count still shows when the server hides it from its status response or the status query times out; it falls back to the status query when `list` is unavailable, and the result is cached for 60 s so the realtime view does not spam commands
+- **Latency**: direct-connect Minecraft SLP ping (no QueQiao relay, no RCON) — a public probe address must be filled in Settings; servers with SLP disabled or unreachable addresses report latency as unavailable. If the server enables `proxy-protocol` (common behind FRP tunnels), the plugin automatically retries once with a PROXY v2 header, no extra configuration needed
+- TPS and latency failures are reported **separately**, so one never hides the other; `/mc status` also shows the latest samples
+- Samples are stored per-day under `data_dir/monitor/` and survive restarts
 
 ## Deployment and FAQ
 

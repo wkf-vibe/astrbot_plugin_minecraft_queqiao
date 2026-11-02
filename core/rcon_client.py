@@ -6,11 +6,20 @@
 
 import asyncio
 import contextlib
+import re
 
 from astrbot.api import logger
 
 from .constants import PLUGIN_NAME
 from .models_config import ServerConfig
+
+# `There are 2 of a max of 20 players online:` —— 人数与上限；部分服务端写
+# `a max of`/`a maximum of`，两种都容忍
+_LIST_COUNT_RE = re.compile(
+    r"There\s+are\s+(\d+)\s+of\s+a\s+max(?:imum)?\s+of\s+(\d+)", re.IGNORECASE
+)
+# MC 格式化代码（§a 等）：list 输出被染色时先剥离再解析
+_FORMAT_CODE_RE = re.compile(r"§.")
 
 try:  # 惰性降级：缺失依赖时仅关闭兜底通道
     import aiomcrcon
@@ -128,7 +137,31 @@ class RconClient:
 
         兼容形如：`There are 2 of a max of 20 players online: Alice, Bob`
         """
-        if not output or ":" not in output:
-            return []
-        _, _, names = output.partition(":")
-        return [name.strip() for name in names.split(",") if name.strip()]
+        return RconClient.parse_list_output(output)[2]
+
+    @staticmethod
+    def parse_list_output(
+        output: str | None,
+    ) -> tuple[int | None, int | None, list[str]]:
+        """解析 `list` 输出为 ``(在线人数, 上限人数, 玩家名)``。
+
+        形如 ``There are 2 of a max of 20 players online: tree, kebee``；
+        部分服务端会给输出染色（``§a``），先剥离格式码再解析，否则人数与
+        名单都会被颜色码切断。解析不到的字段返回 None（不谎报 0）。
+        """
+        if not output:
+            return None, None, []
+        text = _FORMAT_CODE_RE.sub("", output).strip()
+        online: int | None = None
+        cap: int | None = None
+        match = _LIST_COUNT_RE.search(text)
+        if match:
+            online = int(match.group(1))
+            cap = int(match.group(2))
+        names: list[str] = []
+        if ":" in text:
+            _, _, raw_names = text.partition(":")
+            names = [name.strip() for name in raw_names.split(",") if name.strip()]
+        if online is None and names:
+            online = len(names)
+        return online, cap, names
